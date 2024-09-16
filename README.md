@@ -1,7 +1,3 @@
-Here is a GitHub repository description for your project **TaskMate**:
-
----
-
 ## TaskMate
 
 TaskMate is an AI-powered assistant that integrates with Microsoft 365 to help users manage their calendars seamlessly. It allows users to create, update, delete, and search for calendar events, all through intuitive and interactive prompts. TaskMate leverages OpenAI’s GPT models alongside Microsoft Graph API to provide powerful calendar management functionalities directly from the terminal.
