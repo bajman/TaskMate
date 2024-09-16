@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 from dateutil.parser import parse as parse_date
 from typing import List, Dict, Any
 from msal import PublicClientApplication, SerializableTokenCache
@@ -20,12 +20,30 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.styles import Style
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from pydantic import BaseModel
 
-PROMPT_STYLE = Style.from_dict({
-    'prompt': 'ansicyan bold',
-    'instruction': 'ansigreen',
-    'input': 'ansiwhite',
-})
+def get_custom_prompt(current_datetime):
+    return f'Calendar Assistant ({current_datetime})> '
+
+def get_history():
+    return FileHistory('.calendar_assistant_history')
+
+def get_key_bindings():
+    kb = KeyBindings()
+    
+    @kb.add('c-d')
+    def _(event):
+        "Exit when 'c-d' is pressed."
+        event.app.exit()
+    
+    @kb.add('c-l')
+    def _(event):
+        "Clear the screen when 'c-l' is pressed."
+        event.app.current_buffer.text = ''
+    
+    return kb
 
 logging.basicConfig(
     filename='chatbot.log',
@@ -119,6 +137,10 @@ def parse_natural_language_date(date_str: str, tz_str: str = 'America/New_York')
         logger.error(f"Unable to parse date: {date_str}")
         raise ValueError(f"Unable to parse date: {date_str}")
 
+    # Ensure the parsed date is timezone-aware
+    if parsed_date.tzinfo is None:
+        parsed_date = timezone.localize(parsed_date)
+
     logger.debug(f"Parsed date: {parsed_date.isoformat()}")
     return parsed_date
 
@@ -201,18 +223,22 @@ def format_event_preview(event_data: Dict[str, Any]) -> None:
     table.add_column("Value")
 
     for field in ['subject', 'body', 'start', 'end', 'location', 'attendees',
-                  'recurrence', 'reminderMinutesBeforeStart', 'categories']:
+                  'recurrence', 'reminderMinutesBeforeStart', 'categories', 'isAllDay']:
         value = event_data.get(field)
 
-        if field in ('start', 'end') and isinstance(value, dict):
-            date_time = value.get('dateTime', '')
-            time_zone = value.get('timeZone', 'UTC')
-            try:
-                formatted_dt = format_datetime_us(date_time)
-                value = f"{formatted_dt} ({time_zone})"
-            except Exception as e:
-                value = f"{date_time} ({time_zone})"
-                logger.error(f"Error formatting datetime for field '{field}': {e}")
+        if field in ('start', 'end'):
+            if event_data.get('isAllDay', False):
+                date = value.get('date', '')
+                value = f"{date} (All day)"
+            else:
+                date_time = value.get('dateTime', '')
+                time_zone = value.get('timeZone', 'UTC')
+                try:
+                    formatted_dt = format_datetime_us(date_time)
+                    value = f"{formatted_dt} ({time_zone})"
+                except Exception as e:
+                    value = f"{date_time} ({time_zone})"
+                    logger.error(f"Error formatting datetime for field '{field}': {e}")
         elif field == 'location' and isinstance(value, dict):
             value = value.get('displayName', '')
         elif field == 'attendees':
@@ -227,6 +253,8 @@ def format_event_preview(event_data: Dict[str, Any]) -> None:
             value = 'None'
         elif field == 'reminderMinutesBeforeStart' and not value:
             value = 'None'
+        elif field == 'isAllDay':
+            value = 'Yes' if value else 'No'
 
         table.add_row(field.capitalize(), str(value))
 
@@ -246,8 +274,11 @@ def validate_event_data(event_data: Dict[str, Any]) -> bool:
         return False
     
     try:
-        parse_natural_language_date(event_data['start'])
-        parse_natural_language_date(event_data['end'])
+        start = parse_natural_language_date(event_data['start'])
+        end = parse_natural_language_date(event_data['end'])
+        if end <= start:
+            console.print("[bold red]Error: End time must be after start time.[/bold red]")
+            return False
     except ValueError as ve:
         console.print(f"[bold red]Error: Invalid date format - {ve}[/bold red]")
         return False
@@ -255,102 +286,121 @@ def validate_event_data(event_data: Dict[str, Any]) -> bool:
     return True
 
 
-async def create_event(event_data: Dict[str, Any], tz_str: str = 'America/New_York', max_retries: int = 3) -> None:
-    if not validate_event_data(event_data):
+class CalendarEvent(BaseModel):
+    subject: str
+    start: str
+    end: str
+    location: str = ""
+    attendees: List[str] = []
+    reminderMinutesBeforeStart: int = 15
+    categories: List[str] = []
+    isAllDay: bool = False
+    body: str = ""
+
+import time
+
+async def create_event(event_data: dict, tz_str: str = 'America/New_York', max_retries: int = 3) -> None:
+    # Ensure that event_data is converted into a CalendarEvent object
+    try:
+        event_data = CalendarEvent(**event_data)
+    except ValueError as e:
+        console.print(f"[bold red]Error: Invalid event data provided - {e}[/bold red]")
         return
 
     for attempt in range(max_retries):
         try:
-            start_datetime = parse_natural_language_date(event_data.get('start'), tz_str=tz_str)
-            end_datetime = parse_natural_language_date(event_data.get('end'), tz_str=tz_str)
-            logger.debug(f"Parsed start_datetime: {start_datetime}")
-            logger.debug(f"Parsed end_datetime: {end_datetime}")
+            start_datetime = parse_natural_language_date(event_data.start, tz_str=tz_str)
+            end_datetime = parse_natural_language_date(event_data.end, tz_str=tz_str)
 
-            # Rest of the event creation code...
+            new_event = {
+                'subject': event_data.subject,
+                'body': {
+                    'contentType': 'text',
+                    'content': event_data.body
+                },
+                'isAllDay': event_data.isAllDay,
+                'start': {
+                    'dateTime': start_datetime.isoformat() if not event_data.isAllDay else start_datetime.date().isoformat(),
+                    'timeZone': tz_str
+                },
+                'end': {
+                    'dateTime': end_datetime.isoformat() if not event_data.isAllDay else end_datetime.date().isoformat(),
+                    'timeZone': tz_str
+                }
+            }
 
-            console.print(f"[bold green]Event '{event_data.get('subject', '')}' created successfully.[/bold green]")
-            logger.info(f"Event '{event_data.get('subject', '')}' created successfully.")
-            return  # Exit if successful
-        except ValueError as ve:
-            console.print(f"[bold red]{ve}[/bold red]")
-            logger.error(f"Date parsing error: {ve}")
-            if attempt == max_retries - 1:
-                console.print(f"[bold red]Failed to create event after {max_retries} attempts.[/bold red]")
+            if event_data.location:
+                new_event['location'] = {'displayName': event_data.location}
+
+            if event_data.attendees:
+                new_event['attendees'] = [{'emailAddress': {'address': email}} for email in event_data.attendees]
+
+            if event_data.reminderMinutesBeforeStart is not None:
+                new_event['reminderMinutesBeforeStart'] = event_data.reminderMinutesBeforeStart
+
+            if event_data.categories:
+                new_event['categories'] = event_data.categories
+
+            logger.debug(f"Event payload: {json.dumps(new_event, indent=2)}")
+
+            console.print("\n[bold yellow]Event Preview:[/bold yellow]")
+            format_event_preview(new_event)
+
+            calendars = await cache_calendars()
+            console.print("\n[bold cyan]Available Calendars:[/bold cyan]")
+            for idx, calendar in enumerate(calendars, start=1):
+                console.print(f"{idx}. {calendar['name']}")
+            
+            calendar_completer = WordCompleter([str(i) for i in range(1, len(calendars)+1)])
+            session = PromptSession()
+            while True:
+                calendar_choice = await session.prompt_async("Select a calendar (number): ", completer=calendar_completer)
+                try:
+                    calendar_index = int(calendar_choice) - 1
+                    if 0 <= calendar_index < len(calendars):
+                        selected_calendar = calendars[calendar_index]
+                        break
+                    else:
+                        console.print("[bold red]Invalid selection. Please try again.[/bold red]")
+                except ValueError:
+                    console.print("[bold red]Please enter a valid number.[/bold red]")
+
+            calendar_id = selected_calendar['id']
+
+            confirmation = await session.prompt_async("Do you want to create this event? (yes/no): ", completer=WordCompleter(['yes', 'no']))
+            if confirmation.lower() != "yes":
+                console.print("[bold red]Event creation canceled.[/bold red]")
                 return
+
+            access_token = get_access_token()
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Content-Type': 'application/json'
+            }
+            url = f'https://graph.microsoft.com/v1.0/me/calendars/{calendar_id}/events'
+            response = await make_api_call('POST', url, headers, json=new_event)
+
+            if 'error' in response:
+                error_code = response['error'].get('code', '')
+                if error_code == 'UnableToDeserializePostBody':
+                    logger.error(f"Deserialization error. Payload: {json.dumps(new_event, indent=2)}")
+                    console.print("[bold red]Error: The event data couldn't be processed. Please check the event details.[/bold red]")
+                    return
+                raise Exception(f"Failed to create event: {response['error']}")
+
+            console.print(f"[bold green]Event '{event_data.subject}' created successfully in calendar '{selected_calendar['name']}'.[/bold green]")
+            logger.info(f"Event '{event_data.subject}' created successfully in calendar '{selected_calendar['name']}'.")
+            return
+
         except Exception as e:
             logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
-            if attempt == max_retries - 1:
-                console.print(f"[bold red]Failed to create event after {max_retries} attempts.[/bold red]")
-                return
-
-    new_event = {
-        'subject': event_data.get('subject'),
-        'body': {
-            'contentType': 'text',
-            'content': event_data.get('body', '')
-        },
-        'start': {
-            'dateTime': start_datetime.isoformat(),
-            'timeZone': tz_str
-        },
-        'end': {
-            'dateTime': end_datetime.isoformat(),
-            'timeZone': tz_str
-        },
-        'location': {
-            'displayName': event_data.get('location', '')
-        },
-        'attendees': [
-            {'emailAddress': {'address': email}} for email in event_data.get('attendees', [])
-        ],
-    }
-
-    # Display event preview
-    console.print("\n[bold yellow]Event Preview:[/bold yellow]")
-    format_event_preview(new_event)
-
-    # Prompt user to select a calendar
-    calendars = await cache_calendars()
-    console.print("\n[bold cyan]Available Calendars:[/bold cyan]")
-    for idx, calendar in enumerate(calendars, start=1):
-        console.print(f"{idx}. {calendar['name']}")
-    
-    calendar_completer = WordCompleter([str(i) for i in range(1, len(calendars)+1)])
-    session = PromptSession()
-    while True:
-        calendar_choice = await session.prompt_async("Select a calendar (number): ", completer=calendar_completer)
-        try:
-            calendar_index = int(calendar_choice) - 1
-            if 0 <= calendar_index < len(calendars):
-                selected_calendar = calendars[calendar_index]
-                break
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 0.5  # Exponential backoff
+                console.print(f"[bold yellow]Retrying in {wait_time:.1f} seconds... (Attempt {attempt + 2} of {max_retries})[/bold yellow]")
+                time.sleep(wait_time)
             else:
-                console.print("[bold red]Invalid selection. Please try again.[/bold red]")
-        except ValueError:
-            console.print("[bold red]Please enter a valid number.[/bold red]")
-
-    calendar_id = selected_calendar['id']
-
-    # Confirm event creation
-    confirmation = await session.prompt_async("Do you want to create this event? (yes/no): ", completer=WordCompleter(['yes', 'no']))
-    if confirmation.lower() != "yes":
-        console.print("[bold red]Event creation canceled.[/bold red]")
-        return
-
-    access_token = get_access_token()
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Content-Type': 'application/json'
-    }
-    url = f'https://graph.microsoft.com/v1.0/me/calendars/{calendar_id}/events'
-    response = await make_api_call('POST', url, headers, json=new_event)
-
-    if 'error' in response:
-        console.print(f"[bold red]Failed to create event: {response['error']}[/bold red]")
-        logger.error(f"Failed to create event: {response['error']}")
-    else:
-        console.print(f"[bold green]Event '{event_data.get('subject', '')}' created successfully in calendar '{selected_calendar['name']}'.[/bold green]")
-        logger.info(f"Event '{event_data.get('subject', '')}' created successfully in calendar '{selected_calendar['name']}'.")
+                console.print(f"[bold red]Failed to create event after {max_retries} attempts: {str(e)}[/bold red]")
+                return
 
 
 async def create_events(calendar_id: str, events_data: Any, tz_str: str = 'America/New_York') -> None:
@@ -420,43 +470,44 @@ async def update_event(calendar_id: str, event_id: str, updates: Dict[str, Any],
         logger.error("Attempted to update event with invalid 'event_id'.")
         return
 
-    if 'start' in updates:
-        try:
+    try:
+        is_all_day = updates.get('isAllDay')
+        
+        if 'start' in updates:
+            start_datetime = parse_natural_language_date(updates['start'], tz_str=tz_str)
             updates['start'] = {
-                'dateTime': parse_natural_language_date(updates['start'], tz_str=tz_str).isoformat(),
+                'dateTime': start_datetime.isoformat() if not is_all_day else start_datetime.date().isoformat(),
                 'timeZone': tz_str
             }
-            logger.debug(f"Parsed update start_datetime: {updates['start']['dateTime']}")
-        except ValueError as ve:
-            console.print(f"[bold red]{ve}[/bold red]")
-            logger.error(f"Date parsing error in updates: {ve}")
-            return
 
-    if 'end' in updates:
-        try:
+        if 'end' in updates:
+            end_datetime = parse_natural_language_date(updates['end'], tz_str=tz_str)
             updates['end'] = {
-                'dateTime': parse_natural_language_date(updates['end'], tz_str=tz_str).isoformat(),
+                'dateTime': end_datetime.isoformat() if not is_all_day else (end_datetime.date() + timedelta(days=1)).isoformat(),
                 'timeZone': tz_str
             }
-            logger.debug(f"Parsed update end_datetime: {updates['end']['dateTime']}")
-        except ValueError as ve:
-            console.print(f"[bold red]{ve}[/bold red]")
-            logger.error(f"Date parsing error in updates: {ve}")
-            return
 
-    access_token = get_access_token()
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Content-Type': 'application/json'
-    }
-    url = f'https://graph.microsoft.com/v1.0/me/calendars/{calendar_id}/events/{event_id}'
-    response = await make_api_call('PATCH', url, headers, json=updates)
-    if 'error' in response:
-        console.print(f"[bold red]Failed to update event: {response['error']}[/bold red]")
-        logger.error(f"Failed to update event {event_id}: {response['error']}")
-    else:
+        access_token = get_access_token()
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
+        url = f'https://graph.microsoft.com/v1.0/me/calendars/{calendar_id}/events/{event_id}'
+        
+        if apply_to_series:
+            url += '/instances'
+        
+        response = await make_api_call('PATCH', url, headers, json=updates)
+
+        if 'error' in response:
+            raise Exception(f"Failed to update event: {response['error']}")
+
         console.print(f"[bold green]Event '{event_id}' updated successfully.[/bold green]")
         logger.info(f"Event '{event_id}' updated successfully.")
+
+    except Exception as e:
+        console.print(f"[bold red]Error updating event: {str(e)}[/bold red]")
+        logger.error(f"Error updating event: {str(e)}")
 
 async def delete_calendar(calendar_name: str) -> None:
     access_token = get_access_token()
@@ -516,16 +567,27 @@ async def delete_event(calendar_id: str, event_id: str, cancel_occurrence: bool,
         logger.error("Attempted to delete event with invalid 'event_id'.")
         return
 
-    access_token = get_access_token()
-    headers = {'Authorization': f'Bearer {access_token}'}
-    url = f'https://graph.microsoft.com/v1.0/me/calendars/{calendar_id}/events/{event_id}'
-    response = await make_api_call('DELETE', url, headers)
-    if 'error' in response:
-        console.print(f"[bold red]Failed to delete event: {response['error']}[/bold red]")
-        logger.error(f"Failed to delete event {event_id}: {response['error']}")
-    else:
+    try:
+        access_token = get_access_token()
+        headers = {'Authorization': f'Bearer {access_token}'}
+        url = f'https://graph.microsoft.com/v1.0/me/calendars/{calendar_id}/events/{event_id}'
+        
+        if cancel_occurrence:
+            url += '/instances'
+        elif cancel_series:
+            url += '/series'
+        
+        response = await make_api_call('DELETE', url, headers)
+
+        if 'error' in response:
+            raise Exception(f"Failed to delete event: {response['error']}")
+
         console.print(f"[bold green]Event '{event_id}' deleted successfully.[/bold green]")
         logger.info(f"Event '{event_id}' deleted successfully.")
+
+    except Exception as e:
+        console.print(f"[bold red]Error deleting event: {str(e)}[/bold red]")
+        logger.error(f"Error deleting event: {str(e)}")
 
 
 async def list_events(calendar_id: str, filters: Dict[str, Any], tz_str: str = 'America/New_York') -> None:
@@ -600,14 +662,18 @@ async def get_event(calendar_id: str, event_id: str, properties: List[str], tz_s
             value = event.get(prop, '')
             if isinstance(value, dict):
                 if prop in ['start', 'end']:
-                    date_time = value.get('dateTime', '')
-                    time_zone = value.get('timeZone', 'UTC')
-                    try:
-                        formatted_dt = format_datetime_us(date_time)
-                        value = f"{formatted_dt} ({time_zone})"
-                    except Exception as e:
-                        value = f"{date_time} ({time_zone})"
-                        logger.error(f"Error formatting datetime for property '{prop}': {e}")
+                    if event.get('isAllDay', False):
+                        date = value.get('date', '')
+                        value = f"{date} (All day)"
+                    else:
+                        date_time = value.get('dateTime', '')
+                        time_zone = value.get('timeZone', 'UTC')
+                        try:
+                            formatted_dt = format_datetime_us(date_time)
+                            value = f"{formatted_dt} ({time_zone})"
+                        except Exception as e:
+                            value = f"{date_time} ({time_zone})"
+                            logger.error(f"Error formatting datetime for property '{prop}': {e}")
                 else:
                     value = json.dumps(value, indent=2)
             elif isinstance(value, list):
@@ -616,6 +682,8 @@ async def get_event(calendar_id: str, event_id: str, properties: List[str], tz_s
                     value = attendees_formatted if attendees_formatted else 'None'
                 else:
                     value = ', '.join([str(item) for item in value]) if value else 'None'
+            elif prop == 'isAllDay':
+                value = 'Yes' if value else 'No'
             elif not value:
                 value = 'None'
             table.add_row(prop.capitalize(), str(value))
@@ -893,7 +961,8 @@ def get_function_schemas() -> List[Dict[str, Any]]:
                                 "items": {"type": "string"}
                             },
                             "reminderMinutesBeforeStart": {"type": "integer"},
-                            "isReminderOn": {"type": "boolean"}
+                            "isReminderOn": {"type": "boolean"},
+                            "isAllDay": {"type": "boolean"}
                         },
                         "required": ["subject", "start", "end"]
                     }
@@ -963,7 +1032,8 @@ def get_function_schemas() -> List[Dict[str, Any]]:
                                 "items": {"type": "string"}
                             },
                             "reminderMinutesBeforeStart": {"type": "integer"},
-                            "isReminderOn": {"type": "boolean"}
+                            "isReminderOn": {"type": "boolean"},
+                            "isAllDay": {"type": "boolean"}
                         }
                     },
                     "apply_to_series": {"type": "boolean"}
@@ -1096,6 +1166,9 @@ Get Event Details: Provide comprehensive information about specific events upon 
 Manage Calendars: List, organize, add, or remove calendars.
 Search Events: Find events across all calendars based on specified criteria.
 Manage Categories: Organize and manage event categories for better classification and filtering.
+
+Current Date and Time:
+You are aware of the current date and time, which will be provided to you in each user interaction. Use this information to provide context-aware responses and to handle relative time expressions accurately.
 Input Improvement & Clarification:
 When users provide input that is unclear, incomplete, or scattered, your role is to:
 
@@ -1166,14 +1239,17 @@ async def async_main():
 
     functions = get_function_schemas()
 
-    session = PromptSession()
+    session = PromptSession(
+        history=get_history(),
+        key_bindings=get_key_bindings(),
+    )
+
     while True:
         try:
+            current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             user_input = await session.prompt_async(
-                HTML('<prompt>You</prompt> '),
-                style=PROMPT_STYLE,
+                get_custom_prompt(current_datetime),
                 multiline=False,
-                prompt_continuation='> ',
             )
         except EOFError:
             console.print("[bold blue]No input received. Exiting...[/bold blue]")
@@ -1196,10 +1272,12 @@ async def async_main():
         console.print("[bold magenta]Assistant is thinking...[/bold magenta]")
 
         try:
+            current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            system_message_with_time = f"{SYSTEM_MESSAGE}\n\nCurrent date and time: {current_datetime}"
             response = await asyncio.to_thread(
                 client.chat.completions.create,
                 model="gpt-4o-mini",
-                messages=[{"role": "system", "content": SYSTEM_MESSAGE}] + trimmed_history,
+                messages=[{"role": "system", "content": system_message_with_time}] + trimmed_history,
                 functions=functions,
                 function_call="auto",
                 temperature=0.2,
@@ -1291,52 +1369,56 @@ async def async_main():
                     await create_events(events_data)
 
                 elif function_name == "update_event":
-                    calendar_name = function_args.get('calendar_name', '').lower()
+                    calendar_name = function_args.get('calendar_name')
+                    calendar_name = calendar_name.lower() if calendar_name else None
                     event_id = function_args.get('event_id')
                     updates = function_args.get('updates', {})
                     apply_to_series = function_args.get('apply_to_series', False)
-                    calendar_id = id_cache.get(calendar_name, get_default_calendar_id())
+                    calendar_id = id_cache.get(calendar_name, get_default_calendar_id()) if calendar_name else get_default_calendar_id()
                     if not calendar_id:
-                        console.print(f"[bold red]Calendar '{calendar_name}' not found and no default calendar available.[/bold red]")
-                        logger.error(f"Calendar '{calendar_name}' not found and no default calendar available.")
+                        console.print(f"[bold red]Calendar '{calendar_name or 'Default'}' not found and no default calendar available.[/bold red]")
+                        logger.error(f"Calendar '{calendar_name or 'Default'}' not found and no default calendar available.")
                         continue
                     await update_event(calendar_id, event_id, updates, apply_to_series)
 
                 elif function_name == "delete_event":
-                    calendar_name = function_args.get('calendar_name', '').lower()
+                    calendar_name = function_args.get('calendar_name')
+                    calendar_name = calendar_name.lower() if calendar_name else None
                     event_id = function_args.get('event_id')
                     cancel_occurrence = function_args.get('cancel_occurrence', False)
                     cancel_series = function_args.get('cancel_series', False)
-                    calendar_id = id_cache.get(calendar_name, get_default_calendar_id())
+                    calendar_id = id_cache.get(calendar_name, get_default_calendar_id()) if calendar_name else get_default_calendar_id()
                     if not calendar_id:
-                        console.print(f"[bold red]Calendar '{calendar_name}' not found and no default calendar available.[/bold red]")
-                        logger.error(f"Calendar '{calendar_name}' not found and no default calendar available.")
+                        console.print(f"[bold red]Calendar '{calendar_name or 'Default'}' not found and no default calendar available.[/bold red]")
+                        logger.error(f"Calendar '{calendar_name or 'Default'}' not found and no default calendar available.")
                         continue
                     await delete_event(calendar_id, event_id, cancel_occurrence, cancel_series)
 
                 elif function_name == "list_events":
-                    calendar_name = function_args.get('calendar_name', '').lower()
+                    calendar_name = function_args.get('calendar_name')
+                    calendar_name = calendar_name.lower() if calendar_name else None
                     filters = {
                         'start_datetime': function_args.get('start_datetime'),
                         'end_datetime': function_args.get('end_datetime'),
                         'categories': function_args.get('categories'),
                         'subject_contains': function_args.get('subject_contains')
                     }
-                    calendar_id = id_cache.get(calendar_name, get_default_calendar_id())
+                    calendar_id = id_cache.get(calendar_name, get_default_calendar_id()) if calendar_name else get_default_calendar_id()
                     if not calendar_id:
-                        console.print(f"[bold red]Calendar '{calendar_name}' not found and no default calendar available.[/bold red]")
-                        logger.error(f"Calendar '{calendar_name}' not found and no default calendar available.")
+                        console.print(f"[bold red]Calendar '{calendar_name or 'Default'}' not found and no default calendar available.[/bold red]")
+                        logger.error(f"Calendar '{calendar_name or 'Default'}' not found and no default calendar available.")
                         continue
                     await list_events(calendar_id, filters)
 
                 elif function_name == "get_event":
-                    calendar_name = function_args.get('calendar_name', '').lower()
+                    calendar_name = function_args.get('calendar_name')
+                    calendar_name = calendar_name.lower() if calendar_name else None
                     event_id = function_args.get('event_id')
                     properties = function_args.get('properties', [])
-                    calendar_id = id_cache.get(calendar_name, get_default_calendar_id())
+                    calendar_id = id_cache.get(calendar_name, get_default_calendar_id()) if calendar_name else get_default_calendar_id()
                     if not calendar_id:
-                        console.print(f"[bold red]Calendar '{calendar_name}' not found and no default calendar available.[/bold red]")
-                        logger.error(f"Calendar '{calendar_name}' not found and no default calendar available.")
+                        console.print(f"[bold red]Calendar '{calendar_name or 'Default'}' not found and no default calendar available.[/bold red]")
+                        logger.error(f"Calendar '{calendar_name or 'Default'}' not found and no default calendar available.")
                         continue
                     await get_event(calendar_id, event_id, properties)
 
@@ -1433,10 +1515,4 @@ if __name__ == '__main__':
         logger.exception("Unhandled exception in main")
         console.print(f"[bold red]An error occurred: {e}[/bold red]")
 
-def get_calendar_completer(calendars: List[Dict[str, Any]]) -> WordCompleter:
-    calendar_names = [cal['name'] for cal in calendars]
-    return WordCompleter(calendar_names)
-
-def get_action_completer() -> WordCompleter:
-    actions = ['create event', 'update event', 'delete event', 'list events', 'search events', 'manage categories']
-    return WordCompleter(actions)
+# Removed calendar and action completers
