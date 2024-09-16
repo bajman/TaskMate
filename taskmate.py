@@ -300,78 +300,72 @@ class CalendarEvent(BaseModel):
 import time
 
 async def create_event(event_data: dict, tz_str: str = 'America/New_York', max_retries: int = 3) -> None:
-    # Ensure that event_data is converted into a CalendarEvent object
     try:
         event_data = CalendarEvent(**event_data)
     except ValueError as e:
         console.print(f"[bold red]Error: Invalid event data provided - {e}[/bold red]")
         return
 
+    start_datetime = parse_natural_language_date(event_data.start, tz_str=tz_str)
+    end_datetime = parse_natural_language_date(event_data.end, tz_str=tz_str)
+
+    new_event = {
+        'subject': event_data.subject,
+        'body': {
+            'contentType': 'text',
+            'content': event_data.body
+        },
+        'isAllDay': event_data.isAllDay,
+        'start': {
+            'dateTime': start_datetime.isoformat() if not event_data.isAllDay else start_datetime.date().isoformat(),
+            'timeZone': tz_str
+        },
+        'end': {
+            'dateTime': end_datetime.isoformat() if not event_data.isAllDay else end_datetime.date().isoformat(),
+            'timeZone': tz_str
+        }
+    }
+
+    if event_data.location:
+        new_event['location'] = {'displayName': event_data.location}
+
+    if event_data.attendees:
+        new_event['attendees'] = [{'emailAddress': {'address': email}} for email in event_data.attendees]
+
+    if event_data.reminderMinutesBeforeStart is not None:
+        new_event['reminderMinutesBeforeStart'] = event_data.reminderMinutesBeforeStart
+
+    if event_data.categories:
+        new_event['categories'] = event_data.categories
+
+    logger.debug(f"Event payload: {json.dumps(new_event, indent=2)}")
+
+    console.print("\n[bold yellow]Event Preview:[/bold yellow]")
+    format_event_preview(new_event)
+
+    calendars = await cache_calendars()
+    console.print("\n[bold cyan]Available Calendars:[/bold cyan]")
+    for idx, calendar in enumerate(calendars, start=1):
+        console.print(f"{idx}. {calendar['name']}")
+    
+    calendar_completer = WordCompleter([str(i) for i in range(1, len(calendars)+1)])
+    session = PromptSession()
+    while True:
+        calendar_choice = await session.prompt_async("Select a calendar (number): ", completer=calendar_completer)
+        try:
+            calendar_index = int(calendar_choice) - 1
+            if 0 <= calendar_index < len(calendars):
+                selected_calendar = calendars[calendar_index]
+                break
+            else:
+                console.print("[bold red]Invalid selection. Please try again.[/bold red]")
+        except ValueError:
+            console.print("[bold red]Please enter a valid number.[/bold red]")
+
+    calendar_id = selected_calendar['id']
+
     for attempt in range(max_retries):
         try:
-            start_datetime = parse_natural_language_date(event_data.start, tz_str=tz_str)
-            end_datetime = parse_natural_language_date(event_data.end, tz_str=tz_str)
-
-            new_event = {
-                'subject': event_data.subject,
-                'body': {
-                    'contentType': 'text',
-                    'content': event_data.body
-                },
-                'isAllDay': event_data.isAllDay,
-                'start': {
-                    'dateTime': start_datetime.isoformat() if not event_data.isAllDay else start_datetime.date().isoformat(),
-                    'timeZone': tz_str
-                },
-                'end': {
-                    'dateTime': end_datetime.isoformat() if not event_data.isAllDay else end_datetime.date().isoformat(),
-                    'timeZone': tz_str
-                }
-            }
-
-            if event_data.location:
-                new_event['location'] = {'displayName': event_data.location}
-
-            if event_data.attendees:
-                new_event['attendees'] = [{'emailAddress': {'address': email}} for email in event_data.attendees]
-
-            if event_data.reminderMinutesBeforeStart is not None:
-                new_event['reminderMinutesBeforeStart'] = event_data.reminderMinutesBeforeStart
-
-            if event_data.categories:
-                new_event['categories'] = event_data.categories
-
-            logger.debug(f"Event payload: {json.dumps(new_event, indent=2)}")
-
-            console.print("\n[bold yellow]Event Preview:[/bold yellow]")
-            format_event_preview(new_event)
-
-            calendars = await cache_calendars()
-            console.print("\n[bold cyan]Available Calendars:[/bold cyan]")
-            for idx, calendar in enumerate(calendars, start=1):
-                console.print(f"{idx}. {calendar['name']}")
-            
-            calendar_completer = WordCompleter([str(i) for i in range(1, len(calendars)+1)])
-            session = PromptSession()
-            while True:
-                calendar_choice = await session.prompt_async("Select a calendar (number): ", completer=calendar_completer)
-                try:
-                    calendar_index = int(calendar_choice) - 1
-                    if 0 <= calendar_index < len(calendars):
-                        selected_calendar = calendars[calendar_index]
-                        break
-                    else:
-                        console.print("[bold red]Invalid selection. Please try again.[/bold red]")
-                except ValueError:
-                    console.print("[bold red]Please enter a valid number.[/bold red]")
-
-            calendar_id = selected_calendar['id']
-
-            confirmation = await session.prompt_async("Do you want to create this event? (yes/no): ", completer=WordCompleter(['yes', 'no']))
-            if confirmation.lower() != "yes":
-                console.print("[bold red]Event creation canceled.[/bold red]")
-                return
-
             access_token = get_access_token()
             headers = {
                 'Authorization': f'Bearer {access_token}',
@@ -1376,6 +1370,11 @@ async def async_main():
                 if function_name == "create_event":
                     event_data = function_args.get('event', {})
                     await create_event(event_data)
+                    conversation_history.append({
+                        'role': 'assistant',
+                        'content': f"Event '{event_data.get('subject', 'Untitled')}' has been created.",
+                        'timestamp': datetime.utcnow().isoformat()
+                    })
 
                 elif function_name == "create_events":
                     events_data = function_args.get('events', [])
